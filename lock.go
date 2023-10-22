@@ -12,95 +12,50 @@ import (
 )
 
 const (
-	DefaultUniqueField = "key"
-	DefaultTTLField    = "created_at"
+	DefaultKeyField = "key"
+	DefaultTTLField = "created_at"
 )
 
 var (
-	ErrLockIndexCouldNotEnsure = errors.New("could not ensure that the unique index or ttl index exist")
 	ErrLockIndexCouldNotCreate = errors.New("could not create indices on either the unique or ttl field(s)")
-	ErrParamsIsNil             = errors.New("params cannot be nil")
+	ErrParamIsNil              = errors.New("param(s) cannot be nil")
 	ErrDuplicateKey            = errors.New("duplicate key error")
 	ErrNotFoundKey             = errors.New("key does not exist")
 	ErrCouldNotUnlock          = errors.New("could not unlock")
 )
 
-func ensureMongoDBLockIndex(ctx context.Context, c *mongo.Collection, expireAfter time.Duration) error {
-	if c == nil {
-		return ErrParamsIsNil
-	}
-
-	indexView := c.Indexes()
-	indexes, err := indexView.ListSpecifications(ctx)
-	if err != nil {
-		return errors.Wrap(err, ErrLockIndexCouldNotEnsure.Error())
-	}
-
-	ttlIndexExists := false
-	uniqueIndexExists := false
-
-	for _, index := range indexes {
-		elements, err := index.KeysDocument.Elements()
-		if err != nil {
-			return errors.Wrap(err, ErrLockIndexCouldNotEnsure.Error())
-		}
-
-		if len(elements) == 1 {
-			if elements[0].String() == DefaultUniqueField && index.Unique != nil && *index.Unique {
-				uniqueIndexExists = true
-			}
-
-			if elements[0].String() == DefaultTTLField && index.ExpireAfterSeconds != nil && expireAfter.Seconds() == float64(*index.ExpireAfterSeconds) {
-				ttlIndexExists = true
-			}
-		}
-	}
-
-	if !uniqueIndexExists {
-		if _, err := indexView.CreateOne(
-			ctx,
-			mongo.IndexModel{
-				Keys:    bson.D{{Key: DefaultUniqueField, Value: 1}},
-				Options: options.Index().SetUnique(true),
-			},
-		); err != nil {
-			return errors.Wrap(err, ErrLockIndexCouldNotCreate.Error())
-		}
-	}
-
-	if !ttlIndexExists {
-		if _, err := indexView.CreateOne(
-			ctx,
-			mongo.IndexModel{
-				Keys:    bson.D{{Key: DefaultTTLField, Value: 1}},
-				Options: options.Index().SetExpireAfterSeconds(int32(expireAfter.Seconds())),
-			},
-		); err != nil {
-			return errors.Wrap(err, ErrLockIndexCouldNotCreate.Error())
-		}
-	}
-
-	return nil
-}
-
 type MongoDBLockerOptions struct {
-	ExpiresAfter time.Duration
+	ExpireAfter time.Duration
+	KeyField    string
+	TTLField    string
 }
 
 type MongoDBLockerOption func(*MongoDBLockerOptions)
 
 func WithMongoDBLockerExpireAfter(expireAfter time.Duration) MongoDBLockerOption {
 	return func(opts *MongoDBLockerOptions) {
-		opts.ExpiresAfter = expireAfter
+		opts.ExpireAfter = expireAfter
 	}
 }
 
-// A mongoDBLocker is a mutual exclusion lock.
-// This mutex is distributed and backed by mongodb.
+func WithMongoDBLockerKeyField(keyField string) MongoDBLockerOption {
+	return func(opts *MongoDBLockerOptions) {
+		opts.KeyField = keyField
+	}
+}
+
+func WithMongoDBLockerTTLField(ttlField string) MongoDBLockerOption {
+	return func(opts *MongoDBLockerOptions) {
+		opts.TTLField = ttlField
+	}
+}
+
 type mongoDBLocker struct {
 	opts MongoDBLockerOptions
 	c    *mongo.Collection
 }
+
+var _ gocron.Locker = (*mongoDBLocker)(nil)
 
 // NewMongoDBLockerAlways creates a new mongodb-backed distributed locker.
 func NewMongoDBLocker(ctx context.Context, c *mongo.Collection, opts ...MongoDBLockerOption) (*mongoDBLocker, error) {
@@ -118,35 +73,38 @@ func NewMongoDBLockerAlways(ctx context.Context, c *mongo.Collection, opts ...Mo
 
 func newMongoDBLocker(ctx context.Context, c *mongo.Collection, opts ...MongoDBLockerOption) (*mongoDBLocker, error) {
 	if c == nil {
-		return nil, ErrParamsIsNil
+		return nil, ErrParamIsNil
 	}
 
-	m := &mongoDBLocker{c: c}
+	m := &mongoDBLocker{
+		c: c,
+		opts: MongoDBLockerOptions{
+			KeyField: DefaultKeyField,
+			TTLField: DefaultTTLField,
+		},
+	}
 	for _, opt := range opts {
 		opt(&m.opts)
 	}
 
-	if err := ensureMongoDBLockIndex(ctx, c, m.opts.ExpiresAfter); err != nil {
+	if err := m.ensureMongoDBLockIndex(ctx, c, m.opts.ExpireAfter); err != nil {
 		return nil, err
 	}
 
 	return m, nil
 }
 
-var (
-	_ gocron.Lock   = (*mongoDBLock)(nil)
-	_ gocron.Locker = (*mongoDBLocker)(nil)
-)
-
 type mongoDBLock struct {
 	key string
 	c   *mongo.Collection
 }
 
+var _ gocron.Lock = (*mongoDBLock)(nil)
+
 func (ml *mongoDBLocker) Lock(ctx context.Context, key string) (gocron.Lock, error) {
 	_, err := ml.c.InsertOne(ctx, bson.M{
-		DefaultUniqueField: key,
-		DefaultTTLField:    time.Now(),
+		ml.opts.KeyField: key,
+		ml.opts.TTLField: time.Now(),
 	})
 
 	if err != nil && mongo.IsDuplicateKeyError(err) {
@@ -166,6 +124,34 @@ func (ml *mongoDBLock) Unlock(ctx context.Context) error {
 		return ErrCouldNotUnlock
 	} else if res.DeletedCount == 0 {
 		return ErrNotFoundKey
+	}
+
+	return nil
+}
+
+func (ml *mongoDBLocker) ensureMongoDBLockIndex(ctx context.Context, c *mongo.Collection, expireAfter time.Duration) error {
+	if c == nil {
+		return ErrParamIsNil
+	}
+
+	if _, err := c.Indexes().CreateOne(
+		ctx,
+		mongo.IndexModel{
+			Keys:    bson.D{{Key: ml.opts.KeyField, Value: 1}},
+			Options: options.Index().SetUnique(true),
+		},
+	); err != nil {
+		return errors.Wrap(err, ErrLockIndexCouldNotCreate.Error())
+	}
+
+	if _, err := c.Indexes().CreateOne(
+		ctx,
+		mongo.IndexModel{
+			Keys:    bson.D{{Key: ml.opts.TTLField, Value: 1}},
+			Options: options.Index().SetExpireAfterSeconds(int32(expireAfter.Seconds())),
+		},
+	); err != nil {
+		return errors.Wrap(err, ErrLockIndexCouldNotCreate.Error())
 	}
 
 	return nil
