@@ -25,9 +25,10 @@ var (
 )
 
 type MongoDBLockerOptions struct {
-	ExpireAfter time.Duration
-	KeyField    string
-	TTLField    string
+	ExpireAfter  time.Duration
+	KeyField     string
+	TTLField     string
+	UnlockAlways bool
 }
 
 type MongoDBLockerOption func(*MongoDBLockerOptions)
@@ -47,6 +48,12 @@ func WithMongoDBLockerKeyField(keyField string) MongoDBLockerOption {
 func WithMongoDBLockerTTLField(ttlField string) MongoDBLockerOption {
 	return func(opts *MongoDBLockerOptions) {
 		opts.TTLField = ttlField
+	}
+}
+
+func WithMongoDBLockerUnlockAlways() MongoDBLockerOption {
+	return func(opts *MongoDBLockerOptions) {
+		opts.UnlockAlways = true
 	}
 }
 
@@ -95,8 +102,9 @@ func newMongoDBLocker(ctx context.Context, c *mongo.Collection, opts ...MongoDBL
 }
 
 type mongoDBLock struct {
-	key string
-	c   *mongo.Collection
+	key          string
+	unlockAlways bool
+	c            *mongo.Collection
 }
 
 var _ gocron.Lock = (*mongoDBLock)(nil)
@@ -112,12 +120,16 @@ func (ml *mongoDBLocker) Lock(ctx context.Context, key string) (gocron.Lock, err
 	}
 
 	return &mongoDBLock{
-		key: key,
-		c:   ml.c,
+		key:          key,
+		c:            ml.c,
+		unlockAlways: ml.opts.UnlockAlways,
 	}, nil
 }
 
 func (ml *mongoDBLock) Unlock(ctx context.Context) error {
+	if ml.unlockAlways {
+		ctx = context.Background()
+	}
 	res, err := ml.c.DeleteOne(ctx, bson.M{"key": ml.key})
 
 	if err != nil {
