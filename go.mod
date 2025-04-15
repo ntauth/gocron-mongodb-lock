@@ -1,6 +1,6 @@
 module github.com/ntauth/gocron-mongodb-lock
 
-go 1.21.0
+go 1.23
 
 toolchain go1.23.3
 
