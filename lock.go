@@ -4,7 +4,9 @@ import (
 	"context"
 	"time"
 
-	"github.com/go-co-op/gocron"
+	std_errors "errors"
+
+	gocron "github.com/go-co-op/gocron/v2"
 	"github.com/pkg/errors"
 	"go.mongodb.org/mongo-driver/bson"
 	"go.mongodb.org/mongo-driver/mongo"
@@ -13,19 +15,22 @@ import (
 
 const (
 	DefaultKeyField = "key"
-	DefaultTTLField = "created_at"
+	DefaultTTLField = "expires_at"
+	DefaultTTLValue = 5 * time.Minute
 )
 
 var (
-	ErrLockIndexCouldNotCreate = errors.New("could not create indices on either the unique or ttl field(s)")
-	ErrParamIsNil              = errors.New("param(s) cannot be nil")
-	ErrDuplicateKey            = errors.New("duplicate key error")
-	ErrNotFoundKey             = errors.New("key does not exist")
-	ErrCouldNotUnlock          = errors.New("could not unlock")
+	ErrLockIndexCouldNotCreate  = errors.New("could not create indices on either the unique or ttl field(s)")
+	ErrParamIsNil               = errors.New("param(s) cannot be nil")
+	ErrDuplicateKey             = errors.New("duplicate key error")
+	ErrNotFoundKey              = errors.New("key does not exist")
+	ErrCouldNotUnlock           = errors.New("could not unlock")
+	ErrFailedToConnectToMongoDB = errors.New("failed to connect to mongodb")
 )
 
 type MongoDBLockerOptions struct {
 	ExpireAfter  time.Duration
+	LockTTL      time.Duration
 	KeyField     string
 	TTLField     string
 	UnlockAlways bool
@@ -51,6 +56,12 @@ func WithMongoDBLockerTTLField(ttlField string) MongoDBLockerOption {
 	}
 }
 
+func WithMongoDBLockerLockTTL(lockTTL time.Duration) MongoDBLockerOption {
+	return func(opts *MongoDBLockerOptions) {
+		opts.LockTTL = lockTTL
+	}
+}
+
 func WithMongoDBLockerUnlockAlways() MongoDBLockerOption {
 	return func(opts *MongoDBLockerOptions) {
 		opts.UnlockAlways = true
@@ -67,7 +78,7 @@ var _ gocron.Locker = (*mongoDBLocker)(nil)
 // NewMongoDBLockerAlways creates a new mongodb-backed distributed locker.
 func NewMongoDBLocker(ctx context.Context, c *mongo.Collection, opts ...MongoDBLockerOption) (*mongoDBLocker, error) {
 	if err := c.Database().Client().Ping(ctx, nil); err != nil {
-		return nil, errors.Wrapf(err, gocron.ErrFailedToConnectToRedis.Error())
+		return nil, std_errors.Join(ErrFailedToConnectToMongoDB, err)
 	}
 
 	return newMongoDBLocker(ctx, c, opts...)
@@ -109,10 +120,21 @@ type mongoDBLock struct {
 
 var _ gocron.Lock = (*mongoDBLock)(nil)
 
-func (ml *mongoDBLocker) Lock(ctx context.Context, key string) (gocron.Lock, error) {
+func (ml *mongoDBLocker) Lock(ctx context.Context, key string, ttl *time.Duration) (gocron.Lock, error) {
+	expiry := time.Now()
+
+	if ttl != nil {
+		expiry = expiry.Add(*ttl)
+	} else if ml.opts.LockTTL != 0 {
+		expiry = expiry.Add(ml.opts.LockTTL)
+	} else {
+		expiry = expiry.Add(DefaultTTLValue)
+	}
+
 	_, err := ml.c.InsertOne(ctx, bson.M{
 		ml.opts.KeyField: key,
-		ml.opts.TTLField: time.Now(),
+		"created_at":     time.Now(),
+		ml.opts.TTLField: expiry,
 	})
 
 	if err != nil && mongo.IsDuplicateKeyError(err) {
@@ -159,7 +181,8 @@ func (ml *mongoDBLocker) ensureMongoDBLockIndex(ctx context.Context, c *mongo.Co
 	if _, err := c.Indexes().CreateOne(
 		ctx,
 		mongo.IndexModel{
-			Keys:    bson.D{{Key: ml.opts.TTLField, Value: 1}},
+			Keys: bson.D{{Key: ml.opts.TTLField, Value: 1}},
+			// ExpireAfterSeconds mark documents to be deleted after X seconds from when the TTLField has become lower or equal to the current time.
 			Options: options.Index().SetExpireAfterSeconds(int32(expireAfter.Seconds())),
 		},
 	); err != nil {
