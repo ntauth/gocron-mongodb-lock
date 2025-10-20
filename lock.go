@@ -78,7 +78,7 @@ var _ gocron.Locker = (*mongoDBLocker)(nil)
 // NewMongoDBLockerAlways creates a new mongodb-backed distributed locker.
 func NewMongoDBLocker(ctx context.Context, c *mongo.Collection, opts ...MongoDBLockerOption) (*mongoDBLocker, error) {
 	if err := c.Database().Client().Ping(ctx, nil); err != nil {
-		return nil, std_errors.Join(ErrFailedToConnectToMongoDB, err)
+		return nil, std_errors.Join(err, ErrFailedToConnectToMongoDB)
 	}
 
 	return newMongoDBLocker(ctx, c, opts...)
@@ -154,7 +154,7 @@ func (ml *mongoDBLocker) Lock(ctx context.Context, key string, ttl *time.Duratio
 
 	if err != nil {
 		if mongo.IsDuplicateKeyError(err) {
-			return nil, errors.Wrap(err, ErrDuplicateKey.Error())
+			return nil, std_errors.Join(err, ErrDuplicateKey)
 		}
 		return nil, err
 	}
@@ -173,9 +173,9 @@ func (ml *mongoDBLock) Unlock(ctx context.Context) error {
 	res, err := ml.c.DeleteOne(ctx, bson.M{"key": ml.key})
 
 	if err != nil {
-		return errors.Wrap(err, ErrCouldNotUnlock.Error())
+		return std_errors.Join(err, ErrCouldNotUnlock)
 	} else if res.DeletedCount == 0 {
-		return errors.Wrap(err, ErrNotFoundKey.Error())
+		return std_errors.Join(err, ErrNotFoundKey)
 	}
 
 	return nil
@@ -193,7 +193,7 @@ func (ml *mongoDBLocker) ensureMongoDBLockIndex(ctx context.Context, c *mongo.Co
 			Options: options.Index().SetUnique(true),
 		},
 	); err != nil {
-		return errors.Wrap(err, ErrLockIndexCouldNotCreate.Error())
+		return std_errors.Join(err, ErrLockIndexCouldNotCreate)
 	}
 
 	if _, err := c.Indexes().CreateOne(
@@ -204,7 +204,7 @@ func (ml *mongoDBLocker) ensureMongoDBLockIndex(ctx context.Context, c *mongo.Co
 			Options: options.Index().SetExpireAfterSeconds(int32(expireAfter.Seconds())),
 		},
 	); err != nil {
-		return errors.Wrap(err, ErrLockIndexCouldNotCreate.Error())
+		return std_errors.Join(err, ErrLockIndexCouldNotCreate)
 	}
 
 	return nil
