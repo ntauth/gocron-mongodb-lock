@@ -131,14 +131,32 @@ func (ml *mongoDBLocker) Lock(ctx context.Context, key string, ttl *time.Duratio
 		expiry = expiry.Add(DefaultTTLValue)
 	}
 
-	_, err := ml.c.InsertOne(ctx, bson.M{
-		ml.opts.KeyField: key,
-		"created_at":     time.Now(),
-		ml.opts.TTLField: expiry,
+	// NOTE(intx4): We wrap the insertOne into a transaction
+	// to alter the mongo driver behaviour from wait-on-conflict
+	// to fail-on-conflict. Indeed, if there's a write conflict,
+	// it means that another job instance is holding the lock,
+	// and as such this job instance should defer and be scheduled
+	// in the next slot by the scheduler
+	session, err := ml.c.Database().Client().StartSession()
+	if err != nil {
+		return nil, err
+	}
+	defer session.EndSession(ctx)
+
+	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
+		_, err := ml.c.InsertOne(sc, bson.M{
+			ml.opts.KeyField: key,
+			"created_at":     time.Now(),
+			ml.opts.TTLField: expiry,
+		})
+		return nil, err
 	})
 
-	if err != nil && mongo.IsDuplicateKeyError(err) {
-		return nil, ErrDuplicateKey
+	if err != nil {
+		if mongo.IsDuplicateKeyError(err) {
+			return nil, errors.Wrap(err, ErrDuplicateKey.Error())
+		}
+		return nil, err
 	}
 
 	return &mongoDBLock{
@@ -155,9 +173,9 @@ func (ml *mongoDBLock) Unlock(ctx context.Context) error {
 	res, err := ml.c.DeleteOne(ctx, bson.M{"key": ml.key})
 
 	if err != nil {
-		return ErrCouldNotUnlock
+		return errors.Wrap(err, ErrCouldNotUnlock.Error())
 	} else if res.DeletedCount == 0 {
-		return ErrNotFoundKey
+		return errors.Wrap(err, ErrNotFoundKey.Error())
 	}
 
 	return nil
